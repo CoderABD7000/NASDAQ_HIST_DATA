@@ -1,4 +1,4 @@
-name: Resample NASDAQ Intraday Data
+name: Generate NAS100 Enriched Metrics Dataset (POCs + ADX/DI)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: write
 
 jobs:
-  build-and-resample:
+  calculate-metrics:
     runs-on: ubuntu-latest
 
     steps:
@@ -22,29 +22,29 @@ jobs:
     - name: Install Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pandas
+        pip install pandas numpy
 
-    - name: Process and Resample Data
+    - name: Run Enriched Metrics Engine
       run: |
         python -c "
         import glob
         import os
         import zipfile
         import pandas as pd
+        import numpy as np
 
-        OUTPUT_DIR = '.'
         UNZIP_DIR = './unzipped'
         COL_NAMES = ['date', 'time', 'open', 'high', 'low', 'close']
-
         os.makedirs(UNZIP_DIR, exist_ok=True)
 
+        # 1. Extract raw archives
         zip_files = glob.glob('*.zip')
-        print(f'Found {len(zip_files)} zip files.')
-        
+        print(f'Extracting {len(zip_files)} raw archive files...')
         for zf in zip_files:
             with zipfile.ZipFile(zf, 'r') as zip_ref:
                 zip_ref.extractall(UNZIP_DIR)
 
+        # 2. Parse and merge into continuous 1m timeline
         all_files = glob.glob(os.path.join(UNZIP_DIR, '**/*.csv'), recursive=True)
         if not all_files:
             all_files = glob.glob(os.path.join(UNZIP_DIR, '**/*.txt'), recursive=True)
@@ -72,29 +72,77 @@ jobs:
         master_1m.sort_values(by='datetime', inplace=True)
         master_1m.set_index('datetime', inplace=True)
 
-        def export_resampled(df, freq_str, filename):
-            resampled = df.resample(freq_str).agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last'
-            }).dropna()
-            resampled['date'] = resampled.index.strftime('%Y.%m.%d')
-            resampled['time'] = resampled.index.strftime('%H:%M')
-            resampled[COL_NAMES].to_csv(filename, index=False)
-            print(f'Saved {filename} ({len(resampled):,} rows)')
+        # 3. Resample base 5m bars
+        df_5m = master_1m.resample('5min').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last'
+        }).dropna()
 
-        export_resampled(master_1m, '5min', 'NAS100_2019_2026_5m.csv')
-        export_resampled(master_1m, '15min', 'NAS100_2019_2026_15m.csv')
-        export_resampled(master_1m, '30min', 'NAS100_2019_2026_30m.csv')
-        export_resampled(master_1m, '1h', 'NAS100_2019_2026_1h.csv')
-        export_resampled(master_1m, '4h', 'NAS100_2019_2026_4h.csv')
+        # 4. Compute ADX, DI+, DI- (14-period Wilder smoothing)
+        def compute_adx_system(df, period=14):
+            high, low, close = df['high'], df['low'], df['close']
+            tr1 = high - low
+            tr2 = (high - close.shift(1)).abs()
+            tr3 = (low - close.shift(1)).abs()
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+            up_move = high - high.shift(1)
+            down_move = low.shift(1) - low
+
+            pos_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+            neg_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+            atr = pd.Series(tr).ewm(alpha=1/period, adjust=False).mean()
+            pos_di = 100 * pd.Series(pos_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
+            neg_di = 100 * pd.Series(neg_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
+
+            dx = 100 * (pos_di - neg_di).abs() / (pos_di + neg_di)
+            adx = dx.ewm(alpha=1/period, adjust=False).mean()
+
+            df['adx_14'] = adx.round(2)
+            df['di_plus_14'] = pos_di.round(2)
+            df['di_minus_14'] = neg_di.round(2)
+            return df
+
+        df_5m = compute_adx_system(df_5m)
+
+        # 5. Compute Frozen POC Levels (Most frequent close price per period)
+        df_5m['date_group'] = df_5m.index.date
+        df_5m['h4_group'] = df_5m.index.floor('4h')
+        df_5m['week_group'] = df_5m.index.to_period('W').dt.start_time
+
+        # Robust Mode calculation avoiding pandas groupby.apply issues
+        daily_poc_map = df_5m.groupby('date_group')['close'].agg(lambda x: x.mode()[0] if not x.empty else np.nan)
+        h4_poc_map = df_5m.groupby('h4_group')['close'].agg(lambda x: x.mode()[0] if not x.empty else np.nan)
+        weekly_poc_map = df_5m.groupby('week_group')['close'].agg(lambda x: x.mode()[0] if not x.empty else np.nan)
+
+        # Shift maps to freeze prior completed session POCs
+        df_5m['daily_poc'] = df_5m['date_group'].map(daily_poc_map.shift(1))
+        df_5m['h4_poc'] = df_5m['h4_group'].map(h4_poc_map.shift(1))
+        df_5m['weekly_poc'] = df_5m['week_group'].map(weekly_poc_map.shift(1))
+
+        # 6. Format columns and save standalone file
+        df_5m['date'] = df_5m.index.strftime('%Y.%m.%d')
+        df_5m['time'] = df_5m.index.strftime('%H:%M')
+
+        final_cols = [
+            'date', 'time', 'open', 'high', 'low', 'close',
+            'daily_poc', 'h4_poc', 'weekly_poc',
+            'adx_14', 'di_plus_14', 'di_minus_14'
+        ]
+
+        df_out = df_5m[final_cols].dropna()
+        output_file = 'NAS100_2019_2026_5m_Enriched_Metrics.csv'
+        df_out.to_csv(output_file, index=False)
+        print(f'Successfully exported: {output_file} ({len(df_out):,} rows)')
         "
 
-    - name: Commit and Push Files
+    - name: Commit and Push Processed File
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add *.csv
-        git commit -m "Generated 5m, 15m, 30m, 1h, and 4h NAS100 resampled datasets" || exit 0
+        git add NAS100_2019_2026_5m_Enriched_Metrics.csv
+        git commit -m "Add standalone NAS100 5m dataset with 3 frozen POCs and ADX/DI metrics" || exit 0
         git push
