@@ -54,7 +54,6 @@ df_5m = (
     .dropna()
 )
 
-
 # 4. Compute ADX, DI+, DI- (14-period Wilder smoothing)
 def compute_adx_system(df, period=14):
     high, low, close = df["high"], df["low"], df["close"]
@@ -93,19 +92,17 @@ def compute_adx_system(df, period=14):
     df["di_minus_14"] = neg_di.round(2)
     return df
 
-
 df_5m = compute_adx_system(df_5m)
 
 # 5. Compute Fast Frozen POC Levels
 df_5m["date_group"] = df_5m.index.date
 df_5m["h4_group"] = df_5m.index.floor("4h")
-df_5m["week_group"] = df_5m.index.to_period("W").dt.start_time
-
+# Fix: Access start_time directly on PeriodIndex without .dt
+df_5m["week_group"] = df_5m.index.to_period("W").start_time
 
 def get_first_mode(series):
     m = series.mode()
     return m.iloc[0] if not m.empty else np.nan
-
 
 daily_poc_map = df_5m.groupby("date_group")["close"].agg(get_first_mode)
 h4_poc_map = df_5m.groupby("h4_group")["close"].agg(get_first_mode)
