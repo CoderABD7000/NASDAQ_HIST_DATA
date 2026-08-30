@@ -47,14 +47,8 @@ master_1m.drop_duplicates(subset=["datetime"], inplace=True)
 master_1m.sort_values(by="datetime", inplace=True)
 master_1m.set_index("datetime", inplace=True)
 
-# 3. Resample base 5m bars
-df_5m = (
-    master_1m.resample("5min")
-    .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-    .dropna()
-)
 
-# 4. Compute ADX, DI+, DI- (14-period Wilder smoothing)
+# 3. Helper function: Compute ADX/DI System
 def compute_adx_system(df, period=14):
     high, low, close = df["high"], df["low"], df["close"]
     tr1 = high - low
@@ -92,46 +86,65 @@ def compute_adx_system(df, period=14):
     df["di_minus_14"] = neg_di.round(2)
     return df
 
-df_5m = compute_adx_system(df_5m)
-
-# 5. Compute Fast Frozen POC Levels
-df_5m["date_group"] = df_5m.index.date
-df_5m["h4_group"] = df_5m.index.floor("4h")
-# Fix: Access start_time directly on PeriodIndex without .dt
-df_5m["week_group"] = df_5m.index.to_period("W").start_time
 
 def get_first_mode(series):
     m = series.mode()
     return m.iloc[0] if not m.empty else np.nan
 
-daily_poc_map = df_5m.groupby("date_group")["close"].agg(get_first_mode)
-h4_poc_map = df_5m.groupby("h4_group")["close"].agg(get_first_mode)
-weekly_poc_map = df_5m.groupby("week_group")["close"].agg(get_first_mode)
 
-df_5m["daily_poc"] = df_5m["date_group"].map(daily_poc_map.shift(1))
-df_5m["h4_poc"] = df_5m["h4_group"].map(h4_poc_map.shift(1))
-df_5m["weekly_poc"] = df_5m["week_group"].map(weekly_poc_map.shift(1))
+# 4. Process all requested timeframes
+timeframes = {
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+}
 
-# 6. Format and save
-df_5m["date"] = df_5m.index.strftime("%Y.%m.%d")
-df_5m["time"] = df_5m.index.strftime("%H:%M")
+for label, rule in timeframes.items():
+    print(f"Processing {label} timeframe...")
 
-final_cols = [
-    "date",
-    "time",
-    "open",
-    "high",
-    "low",
-    "close",
-    "daily_poc",
-    "h4_poc",
-    "weekly_poc",
-    "adx_14",
-    "di_plus_14",
-    "di_minus_14",
-]
+    df_tf = (
+        master_1m.resample(rule)
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+        .dropna()
+    )
 
-df_out = df_5m[final_cols].dropna()
-output_file = "NAS100_2019_2026_5m_Enriched_Metrics.csv"
-df_out.to_csv(output_file, index=False)
-print(f"Successfully generated {output_file} with {len(df_out):,} rows!")
+    df_tf = compute_adx_system(df_tf)
+
+    # Compute Frozen Non-Repainting POC Levels
+    df_tf["date_group"] = df_tf.index.date
+    df_tf["h4_group"] = df_tf.index.floor("4h")
+    df_tf["week_group"] = df_tf.index.to_period("W").start_time
+
+    daily_poc_map = df_tf.groupby("date_group")["close"].agg(get_first_mode)
+    h4_poc_map = df_tf.groupby("h4_group")["close"].agg(get_first_mode)
+    weekly_poc_map = df_tf.groupby("week_group")["close"].agg(get_first_mode)
+
+    df_tf["daily_poc"] = df_tf["date_group"].map(daily_poc_map.shift(1))
+    df_tf["h4_poc"] = df_tf["h4_group"].map(h4_poc_map.shift(1))
+    df_tf["weekly_poc"] = df_tf["week_group"].map(weekly_poc_map.shift(1))
+
+    df_tf["date"] = df_tf.index.strftime("%Y.%m.%d")
+    df_tf["time"] = df_tf.index.strftime("%H:%M")
+
+    final_cols = [
+        "date",
+        "time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "daily_poc",
+        "h4_poc",
+        "weekly_poc",
+        "adx_14",
+        "di_plus_14",
+        "di_minus_14",
+    ]
+
+    df_out = df_tf[final_cols].dropna()
+    output_file = f"NAS100_2019_2026_{label}_Enriched_Metrics.csv"
+    df_out.to_csv(output_file, index=False)
+    print(f"--> Exported: {output_file} ({len(df_out):,} rows)")
+
+print("All datasets generated successfully!")
